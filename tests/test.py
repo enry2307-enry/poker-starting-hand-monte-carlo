@@ -1,9 +1,14 @@
+import csv
 import random
+import tempfile
+import uuid
+from pathlib import Path
 
+import utils.naming as naming
 from utils.naming import format_count
 from core.poker import (
     Card, CardDeck, Hand, NoChipsGameSimulation, Points, Ranks, Suits,
-    best_hand, hand_label, fast_score,
+    best_hand, hand_label, fast_score, hand_sort_key, STREETS,
 )
 
 
@@ -106,6 +111,80 @@ def test_format_count():
     }
     for n, label in cases.items():
         assert format_count(n) == label, (n, format_count(n), label)
+
+
+def test_hand_sort_key():
+    labels = ["22", "AKo", "AA", "AKs", "KQs", "A2s"]
+    assert sorted(labels, key=hand_sort_key) == ["AA", "AKs", "AKo", "A2s", "KQs", "22"]
+
+
+def test_street_leaders_match_reference():
+    """Leaders after the flop / turn / river must match the slow reference evaluator."""
+    sim = NoChipsGameSimulation(5)
+    for _ in range(150):
+        winners = sim._play(track_streets=True)
+        board = sim.table.cards
+        assert list(sim.leaders) == list(STREETS)
+        assert sim.leaders["river"] == winners
+        for street, n_board in zip(STREETS, (3, 4, 5)):
+            keys = {p.name: best_hand(p.cards + board[:n_board]).key() for p in sim.players}
+            top = max(keys.values())
+            expected = {name for name, k in keys.items() if k == top}
+            assert {p.name for p in sim.leaders[street]} == expected, street
+
+
+def test_street_counts_invariants():
+    rounds, players = 400, 4
+    counts = NoChipsGameSimulation(players)._count_streets(rounds)
+    assert sum(counts.dealt.values()) == rounds * players
+    for street in STREETS:
+        assert sum(counts.lead[street].values()) >= rounds  # at least one leader per round
+        for label, n in counts.lead[street].items():
+            assert n <= counts.dealt[label]
+    for street in ("flop", "turn"):
+        for label, n in counts.converted[street].items():
+            assert n <= counts.lead[street][label]
+    # more cards seen -> a lead is more likely to hold: turn conversion >= flop conversion overall
+    flop = sum(counts.converted["flop"].values()) / sum(counts.lead["flop"].values())
+    turn = sum(counts.converted["turn"].values()) / sum(counts.lead["turn"].values())
+    assert 0 < flop <= turn <= 1
+
+
+def test_info_roundtrip():
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp)
+        naming.write_info(folder, run_at="2026-10-08 12:00:00", players=6,
+                          rounds=1_250_000, cores=4, seconds=12.34)
+        assert naming.read_info(folder) == {"players": 6, "rounds": 1_250_000}
+        text = (folder / naming.INFO_NAME).read_text(encoding="utf-8")
+        assert "2026-10-08 12:00:00" in text and "1,250,000" in text
+
+
+def test_simulation_folder_layout():
+    """One run -> one uuid4 folder with the CSV, the 4 graphs and info.md (and no wins heatmap)."""
+    original = naming.SIMULATIONS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        naming.SIMULATIONS_DIR = Path(tmp)
+        try:
+            folder = NoChipsGameSimulation(3).simulate_and_save(300, workers=1)
+        finally:
+            naming.SIMULATIONS_DIR = original
+
+        assert folder.parent == Path(tmp)
+        assert uuid.UUID(folder.name).version == 4
+        assert {p.name for p in folder.iterdir()} == {
+            "info.md", "raw_data.csv", "heatmap_win_rate_river.png",
+            "heatmap_flop.png", "heatmap_turn.png", "lead_conversion.png",
+        }
+        assert naming.read_info(folder) == {"players": 3, "rounds": 300}
+
+        with open(folder / "raw_data.csv", newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert sum(int(r["times_dealt"]) for r in rows) == 300 * 3
+        assert sum(int(r["wins"]) for r in rows) >= 300  # at least one winner per round
+        for r in rows:
+            assert int(r["wins"]) <= int(r["times_dealt"])
+            assert abs(float(r["win_rate"]) - int(r["wins"]) / int(r["times_dealt"])) < 1e-3
 
 
 if __name__ == "__main__":

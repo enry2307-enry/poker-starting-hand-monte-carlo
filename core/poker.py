@@ -3,14 +3,15 @@ from __future__ import annotations
 import csv
 import os
 import random
+import time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, IntEnum, unique
 from itertools import combinations
 from pathlib import Path
 
-from utils.naming import csv_path, timestamp
+from utils.naming import CSV_NAME, new_simulation_dir, timestamp, write_info
 
 
 # ==============
@@ -320,6 +321,33 @@ def hand_label(cards: list[Card]) -> str:
     return r1 + r2 + ("s" if a.suit == b.suit else "o")
 
 
+_RANK_ORDER = "23456789TJQKA"
+
+
+def hand_sort_key(label: str) -> tuple[int, int, bool]:
+    """Orders hands high card first, then low card; suited before offsuit (AA, AKs, AKo, AQs, ...)."""
+    return (-_RANK_ORDER.index(label[0]), -_RANK_ORDER.index(label[1]), label[-1] != "s")
+
+
+STREETS = ("flop", "turn", "river")
+
+
+@dataclass
+class StreetCounts:
+    """Per starting hand: how often it was dealt, how often it was leading after each
+    street, and how often a flop/turn lead went on to win the hand."""
+    dealt: Counter = field(default_factory=Counter)
+    lead: dict = field(default_factory=lambda: {s: Counter() for s in STREETS})
+    converted: dict = field(default_factory=lambda: {s: Counter() for s in STREETS[:2]})
+
+    def merge(self, other: StreetCounts) -> None:
+        self.dealt.update(other.dealt)
+        for street in STREETS:
+            self.lead[street].update(other.lead[street])
+        for street in self.converted:
+            self.converted[street].update(other.converted[street])
+
+
 class NoChipsGameSimulation:
     min_players = 2
     max_players = 9
@@ -333,6 +361,7 @@ class NoChipsGameSimulation:
         self.players = [Player(f"Player {i + 1}") for i in range(number_of_players)]
         self.table = Table()
         self.deck = CardDeck()
+        self.leaders: dict[str, list[Player]] = {}  # filled by _play(track_streets=True)
 
     def _reset(self) -> None:
         for p in self.players:
@@ -346,9 +375,19 @@ class NoChipsGameSimulation:
         self.deck.deal(1)  # burn card
         self.table.receive(self.deck.deal(n))
 
-    def _play(self) -> list[Player]:
-        """Plays one full hand using the fast evaluator. Returns the winning player(s)."""
+    def _leaders(self) -> list[Player]:
+        """Player(s) with the best hand given the cards on the table right now (ties included)."""
+        board = self.table.cards
+        scores = [fast_score(p.cards + board) for p in self.players]
+        top = max(scores)
+        return [p for p, sc in zip(self.players, scores) if sc == top]
+
+    def _play(self, track_streets: bool = False) -> list[Player]:
+        """Plays one full hand using the fast evaluator. Returns the winning player(s).
+        With track_streets=True, `self.leaders` also holds who was ahead after the
+        flop, turn and river."""
         self._reset()
+        self.leaders = {}
 
         self.game_step = GameStep.PRE_FLOP
         for p in self.players:
@@ -356,16 +395,20 @@ class NoChipsGameSimulation:
 
         self.game_step = GameStep.FLOP
         self._deal_to_table(3)
+        if track_streets:
+            self.leaders["flop"] = self._leaders()
         self.game_step = GameStep.TURN
         self._deal_to_table(1)
+        if track_streets:
+            self.leaders["turn"] = self._leaders()
         self.game_step = GameStep.RIVER
         self._deal_to_table(1)
 
         self.game_step = GameStep.SHOWDOWN
-        board = self.table.cards
-        scores = [fast_score(p.cards + board) for p in self.players]
-        top = max(scores)
-        return [p for p, sc in zip(self.players, scores) if sc == top]
+        winners = self._leaders()
+        if track_streets:
+            self.leaders["river"] = winners
+        return winners
 
     def play_round(self) -> list[Winner]:
         """Plays one full hand. Returns the winner(s) with their best 5-card hand; several on a tie."""
@@ -382,54 +425,83 @@ class NoChipsGameSimulation:
                 wins[p.name] += 1
         return wins
 
-    def _count_hands(self, rounds: int) -> tuple[Counter, Counter]:
-        """Plays `rounds` hands; returns (times dealt, wins) per starting-hand label."""
-        dealt: Counter = Counter()
-        wins: Counter = Counter()
+    def _count_streets(self, rounds: int) -> StreetCounts:
+        """Plays `rounds` hands tracking who leads after each street, per starting hand."""
+        counts = StreetCounts()
         for _ in range(rounds):
-            winners = self._play()
+            winners = set(self._play(track_streets=True))
+            labels = {p: hand_label(p.cards) for p in self.players}
             for p in self.players:
-                dealt[hand_label(p.cards)] += 1
-            for p in winners:
-                wins[hand_label(p.cards)] += 1
-        return dealt, wins
+                counts.dealt[labels[p]] += 1
+            for street in STREETS:
+                for p in self.leaders[street]:
+                    counts.lead[street][labels[p]] += 1
+                    if street != "river" and p in winners:
+                        counts.converted[street][labels[p]] += 1
+        return counts
 
-    def simulate_to_csv(self, rounds: int, workers: int | None = None) -> Path:
-        """Runs many rounds (in parallel), saves wins per starting hand to
-        output/raw_data/ and the graphs to output/analysis/<N>players/<samples>/.
-        Ties count as a win for each tied player. `workers=None` picks the core count automatically.
-        Returns the CSV path."""
-        workers = max(1, min(workers or auto_workers(rounds), rounds))
+    @staticmethod
+    def _resolve_workers(rounds: int, workers: int | None) -> int:
+        return max(1, min(workers or auto_workers(rounds), rounds))
 
+    def _distribute(self, rounds: int, workers: int, worker) -> list:
+        """Splits `rounds` across `workers` processes; returns each process's result."""
         if workers == 1:
-            dealt, wins = self._count_hands(rounds)
-        else:
-            base, extra = divmod(rounds, workers)
-            chunks = [base + (i < extra) for i in range(workers)]
-            dealt, wins = Counter(), Counter()
-            with ProcessPoolExecutor(max_workers=workers) as pool:
-                for d, w in pool.map(_worker, [len(self.players)] * workers, chunks):
-                    dealt.update(d)
-                    wins.update(w)
+            return [worker(len(self.players), rounds)]
+        base, extra = divmod(rounds, workers)
+        chunks = [base + (i < extra) for i in range(workers)]
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(worker, [len(self.players)] * workers, chunks))
 
-        order = "23456789TJQKA"
+    @staticmethod
+    def _write_csv(total: StreetCounts, path: Path) -> None:
+        def rate(num: int, den: int) -> float:
+            return round(num / den, 4) if den else 0.0
 
-        def sort_key(label: str):
-            # high card, then low card (desc); suited before offsuit
-            return (-order.index(label[0]), -order.index(label[1]), label[-1] != "s")
-
-        path = csv_path(len(self.players), rounds, timestamp())
-        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["hand", "wins", "times_dealt", "win_rate"])
-            for label in sorted(dealt, key=sort_key):
-                writer.writerow([label, wins[label], dealt[label], round(wins[label] / dealt[label], 4)])
+            writer.writerow([
+                "hand", "times_dealt", "wins", "win_rate",
+                "lead_flop", "lead_turn", "lead_rate_flop", "lead_rate_turn",
+                "flop_lead_won", "turn_lead_won", "conv_rate_flop", "conv_rate_turn",
+            ])
+            for label in sorted(total.dealt, key=hand_sort_key):
+                d = total.dealt[label]
+                wins = total.lead["river"][label]  # leading after the river = winning
+                lf, lt = total.lead["flop"][label], total.lead["turn"][label]
+                fw, tw = total.converted["flop"][label], total.converted["turn"][label]
+                writer.writerow([
+                    label, d, wins, rate(wins, d),
+                    lf, lt, rate(lf, d), rate(lt, d),
+                    fw, tw, rate(fw, lf), rate(tw, lt),
+                ])
 
-        # Graphs generated right after the CSV is saved (lazy import: matplotlib only needed here)
-        from utils.plot_hands import plot_csv
-        plot_csv(path, len(self.players))
-        return path
+    def simulate_and_save(self, rounds: int, workers: int | None = None) -> Path:
+        """Runs `rounds` hands (in parallel) and saves everything for the simulation into
+        its own folder, output/simulations/<uuid4>/:
+        raw_data.csv, the heatmaps (win rate / flop / turn), the lead-conversion chart and info.md.
+        `workers=None` picks the core count automatically. Returns the folder path.
+
+        Ties count as a win (and as a lead) for each tied player."""
+        run_at = timestamp()
+        workers = self._resolve_workers(rounds, workers)
+
+        started = time.perf_counter()
+        total = StreetCounts()
+        for part in self._distribute(rounds, workers, _street_worker):
+            total.merge(part)
+        seconds = time.perf_counter() - started
+
+        folder = new_simulation_dir()
+        self._write_csv(total, folder / CSV_NAME)
+
+        # lazy import: matplotlib is only needed here
+        from utils.plot_hands import plot_simulation
+        plot_simulation(folder, len(self.players), rounds)
+
+        write_info(folder, run_at=run_at, players=len(self.players), rounds=rounds,
+                   cores=workers, seconds=seconds)
+        return folder
 
 
 MIN_ROUNDS_PER_WORKER = 2_000  # below this, process start-up costs more than it saves
@@ -447,6 +519,6 @@ def auto_workers(rounds: int) -> int:
     return max(1, min(cpus, rounds // MIN_ROUNDS_PER_WORKER))
 
 
-def _worker(number_of_players: int, rounds: int) -> tuple[Counter, Counter]:
-    random.seed()  # fresh seed per process, so forked workers don't repeat each other
-    return NoChipsGameSimulation(number_of_players)._count_hands(rounds)
+def _street_worker(number_of_players: int, rounds: int) -> StreetCounts:
+    random.seed()
+    return NoChipsGameSimulation(number_of_players)._count_streets(rounds)

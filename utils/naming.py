@@ -1,16 +1,19 @@
-"""Output folders and file names shared by poker.py and plot_hands.py."""
+"""Output folders, run metadata (info.md) and labels shared by the other modules."""
+import re
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
-RAW_DIR = OUTPUT_DIR / "raw_data"
-ANALYSIS_DIR = OUTPUT_DIR / "analysis"
+SIMULATIONS_DIR = OUTPUT_DIR / "simulations"
+CSV_NAME = "raw_data.csv"
+INFO_NAME = "info.md"
 
 _UNITS = ((1_000, "k"), (1_000_000, "mln"), (1_000_000_000, "bln"))
 
 
 def timestamp() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def format_count(n: int) -> str:
@@ -26,9 +29,47 @@ def format_count(n: int) -> str:
     return f"{value}{suffix}"
 
 
-def csv_path(players: int, rounds: int, stamp: str) -> Path:
-    return RAW_DIR / f"starting_hands_{players}players_{format_count(rounds)}_{stamp}.csv"
+def new_simulation_dir() -> Path:
+    """Creates and returns output/simulations/<uuid4>/ for a new simulation."""
+    folder = SIMULATIONS_DIR / str(uuid.uuid4())
+    folder.mkdir(parents=True)
+    return folder
 
 
-def analysis_dir(players: int, rounds: int) -> Path:
-    return ANALYSIS_DIR / f"{players}players" / format_count(rounds)
+def write_info(folder: Path, *, run_at: str, players: int, rounds: int,
+               cores: int, seconds: float) -> Path:
+    """Writes info.md with the data of the simulation."""
+    text = f"""# Simulation {folder.name}
+
+| Field | Value |
+|-------|-------|
+| Run at | {run_at} |
+| Players | {players} |
+| Rounds | {rounds:,} |
+| Hands dealt | {rounds * players:,} |
+| CPU cores used | {cores} |
+| Simulation time | {seconds:.1f} s |
+
+## Contents
+
+- `raw_data.csv`: wins, win rate, lead counts and lead conversion for each of the 169 starting hands
+- `heatmap_win_rate_river.png`: win rate per starting hand (leading after the river)
+- `heatmap_flop.png`: how often each starting hand leads after the flop
+- `heatmap_turn.png`: how often each starting hand leads after the turn
+- `lead_conversion.png`: of the players leading after the flop / the turn, the share who go on to win the hand
+"""
+    path = folder / INFO_NAME
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def read_info(folder: Path) -> dict[str, int]:
+    """Reads the players and rounds back from a simulation's info.md."""
+    text = (Path(folder) / INFO_NAME).read_text(encoding="utf-8")
+    values = {}
+    for key, field in (("players", "Players"), ("rounds", "Rounds")):
+        match = re.search(rf"\|\s*{field}\s*\|\s*([\d,]+)\s*\|", text)
+        if not match:
+            raise ValueError(f"'{field}' not found in {Path(folder) / INFO_NAME}")
+        values[key] = int(match.group(1).replace(",", ""))
+    return values

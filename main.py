@@ -3,7 +3,7 @@ import runpy
 from pathlib import Path
 
 from core.poker import NoChipsGameSimulation, auto_workers
-from utils.naming import analysis_dir, format_count
+from utils.naming import format_count
 
 
 def ask_int(prompt: str, low: int, high: int | None = None, default: int | None = None) -> int:
@@ -57,11 +57,11 @@ def main() -> None:
 
     workers = auto_workers(rounds)
     print(f"Using {workers} core(s)...")
-    path = NoChipsGameSimulation(number_of_players=players).simulate_to_csv(rounds, workers)
+    folder = NoChipsGameSimulation(number_of_players=players).simulate_and_save(rounds, workers)
 
-    print(f"Done ({format_count(rounds)} rounds). Saved:\n  {path}")
-    for png in sorted(analysis_dir(players, rounds).glob(f"{path.stem}_*.png")):
-        print(f"  {png}")
+    print(f"Done ({format_count(rounds)} rounds). Saved to:\n  {folder}")
+    for item in sorted(folder.iterdir()):
+        print(f"    {item.name}")
 
 
 if __name__ == "__main__":  # required: worker processes re-import this module
